@@ -37,7 +37,7 @@ type SdSpiDevice = ExclusiveDevice<SdSpiBus, Output<'static>, Delay>;
 type SdBlockDevice = SdCard<SdSpiDevice, Delay>;
 type Vm = VolumeManager<SdBlockDevice, DummyTimeSource>;
 
-pub const ALLOWED_EXTENSIONS: [&str; 1] = ["WAV"];
+pub const ALLOWED_EXTENSIONS: [&str; 2] = ["wav", "mp3"];
 
 /// A trivial `TimeSource`; we do not set real file timestamps.
 #[derive(Clone, Copy, Default)]
@@ -180,14 +180,17 @@ impl SdStorage {
             // Check if the file extension is allowed.
             match from_utf8(entry.name.extension()) {
                 Ok(ext) => {
-                    if ALLOWED_EXTENSIONS.contains(&ext) {
+                    if ALLOWED_EXTENSIONS
+                        .iter()
+                        .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                    {
                         out.push(entry.name.clone());
                     }
                 }
                 Err(_) => {}
             }
         });
-        
+
         if let Err(e) = result {
             warn!("Failed to list directory: {:?}", e);
         }

@@ -150,7 +150,7 @@ impl PlaybackController {
         let Self { dac, sd, state, buffers } = self;
         let mut display = display;
 
-        let source = match AudioSource::open(sd, name) {
+        let mut source = match AudioSource::open(sd, name) {
             Some(s) => s,
             None => {
                 warn!("Failed to open track");

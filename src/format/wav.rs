@@ -26,7 +26,7 @@ impl WavDecoder {
     /// Fill `words` with packed stereo frames, zero-padding any remainder.
     /// Returns the count of real frames (0 at EOF).
     pub fn fill_frames(
-        &self,
+        &mut self,
         sd: &SdStorage,
         words: &mut [u32],
         staging: &mut [u8],
