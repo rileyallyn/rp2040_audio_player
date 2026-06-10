@@ -1,0 +1,16 @@
+[default.general]
+chip = "RP2040"
+
+[default.probe]
+protocol = "Swd"
+speed = 5000
+usb_vid = "2e8a"
+usb_pid = "000c"
+serial = "857AFDFC3D0782ED"
+
+[default.reset]
+enabled = true
+halt_afterwards = true
+
+[default.rtt]
+enabled = true
