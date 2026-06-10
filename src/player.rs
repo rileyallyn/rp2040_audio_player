@@ -12,6 +12,8 @@
 //! separate task (buttons, UI, etc.) steer playback while [`PlaybackController::play`]
 //! is awaiting DMA.
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use log::{info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -47,6 +49,31 @@ pub enum State {
     Paused,
 }
 
+const STATE_STOPPED: u8 = 0;
+const STATE_PLAYING: u8 = 1;
+const STATE_PAUSED: u8 = 2;
+
+static PLAYBACK_STATE: AtomicU8 = AtomicU8::new(STATE_STOPPED);
+
+fn set_playback_state(state: State) {
+    let value = match state {
+        State::Stopped => STATE_STOPPED,
+        State::Playing => STATE_PLAYING,
+        State::Paused => STATE_PAUSED,
+    };
+    PLAYBACK_STATE.store(value, Ordering::Relaxed);
+}
+
+/// Mirror of the active transport state, readable from the UI task without
+/// locking the controller during async playback.
+pub fn playback_state() -> State {
+    match PLAYBACK_STATE.load(Ordering::Relaxed) {
+        STATE_PLAYING => State::Playing,
+        STATE_PAUSED => State::Paused,
+        _ => State::Stopped,
+    }
+}
+
 /// Transport commands. Map 1:1 to the Python control methods:
 /// `pause()` -> [`Command::Pause`], `resume()` -> [`Command::Resume`],
 /// `stop()` -> [`Command::Stop`], `toggle_pause()` -> [`Command::Toggle`].
@@ -64,7 +91,16 @@ pub enum Command {
 /// so both the player task and a controller task can reach it.
 pub type PlayerControl = Signal<CriticalSectionRawMutex, Command>;
 
-// 
+/// Request to start playback of a track.
+#[derive(Clone)]
+pub struct PlayRequest {
+    pub name: ShortFileName,
+    pub index: usize,
+    pub total: usize,
+}
+
+pub type PlayRequestSignal = Signal<CriticalSectionRawMutex, PlayRequest>;
+pub type PlaybackDoneSignal = Signal<CriticalSectionRawMutex, ()>;
 
 /// Streams WAV files from the SD card to the DAC.
 pub struct PlaybackController {
@@ -83,6 +119,7 @@ impl PlaybackController {
             b: [0; BUFFER_WORDS],
             staging: [0; BUFFER_FRAMES * FRAME_BYTES],
         });
+        set_playback_state(State::Stopped);
         Self {
             dac,
             sd,
@@ -113,6 +150,7 @@ impl PlaybackController {
     pub fn shutdown(&mut self) {
         self.dac.mute();
         self.state = State::Stopped;
+        set_playback_state(State::Stopped);
     }
 
     /// Enumerate `.wav` tracks on the card into `out`. Mirrors `list_tracks()`.
@@ -155,6 +193,7 @@ impl PlaybackController {
             None => {
                 warn!("Failed to open track");
                 *state = State::Stopped;
+                set_playback_state(State::Stopped);
                 if let Some(d) = display.as_deref_mut() {
                     d.message("Open failed", "skipping track");
                 }
@@ -168,6 +207,7 @@ impl PlaybackController {
 
         dac.mute();
         *state = State::Playing;
+        set_playback_state(State::Playing);
         if let Some(d) = display.as_deref_mut() {
             d.now_playing(index, total, name, *state);
         }
@@ -183,6 +223,7 @@ impl PlaybackController {
             source.close(sd);
             dac.mute();
             *state = State::Stopped;
+            set_playback_state(State::Stopped);
             return false;
         }
         info!("Streaming {} frame(s) from track", primed);
@@ -198,6 +239,7 @@ impl PlaybackController {
                     }
                     Command::Pause | Command::Toggle => {
                         *state = State::Paused;
+                        set_playback_state(State::Paused);
                         dac.mute();
                         if let Some(d) = display.as_deref_mut() {
                             d.now_playing(index, total, name, *state);
@@ -208,6 +250,7 @@ impl PlaybackController {
                             match control.wait().await {
                                 Command::Resume | Command::Toggle => {
                                     *state = State::Playing;
+                                    set_playback_state(State::Playing);
                                     if unmuted {
                                         dac.unmute();
                                     }
@@ -254,6 +297,7 @@ impl PlaybackController {
         dac.mute();
         source.close(sd);
         *state = State::Stopped;
+        set_playback_state(State::Stopped);
         if let Some(d) = display.as_deref_mut() {
             d.now_playing(index, total, name, *state);
         }
