@@ -1,3 +1,7 @@
 # Cargo build artifacts
 /target/
 **/.idea
+
+.DS_Store
+
+.antigravitycli/

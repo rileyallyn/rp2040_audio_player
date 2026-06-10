@@ -9,7 +9,8 @@ mod tone;
 
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::peripherals::PIO0;
+use embassy_rp::dma;
+use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::{peripherals::USB, usb};
 
@@ -24,6 +25,7 @@ use sd::{SdStorage, TrackList};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
 });
 
@@ -78,6 +80,7 @@ async fn main(_spawner: Spawner) -> ! {
         p.PIN_6,
         p.PWM_SLICE0,
         p.PIN_17,
+        Irqs,
     );
 
     if BOOT_TONE_SECS > 0 {

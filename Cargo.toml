@@ -28,7 +28,7 @@ embassy-sync = { version = "0.7" }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
 
 cortex-m = { version = "0.7.7" }
-embassy-rp = { version = "0.9", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
+embassy-rp = { version = "0.10", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
 fixed = { version = "1.29", default-features = false }
 micromath = "2.1"
 pio = "0.3"
