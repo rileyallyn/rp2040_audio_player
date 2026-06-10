@@ -1,5 +1,4 @@
-//! SD-card storage and WAV streaming, the Rust counterpart of `sd.py`
-//! (plus the WAV parsing that lived in `PlaybackController`).
+//! SD-card storage, the Rust counterpart of `sd.py`.
 //!
 //! The MicroPython code mounted the card with `os.mount` and read files with
 //! the standard file API. Here we talk to the card over blocking SPI and parse
@@ -19,7 +18,7 @@ use embedded_sdmmc::{
     VolumeManager,
 };
 
-use crate::dac::pack_frame;
+use core::str::from_utf8;
 
 /// Bytes per stereo frame (16-bit L + 16-bit R), matching `FRAME_BYTES`.
 pub const FRAME_BYTES: usize = 4;
@@ -37,6 +36,8 @@ type SdSpiBus = Spi<'static, SPI0, Blocking>;
 type SdSpiDevice = ExclusiveDevice<SdSpiBus, Output<'static>, Delay>;
 type SdBlockDevice = SdCard<SdSpiDevice, Delay>;
 type Vm = VolumeManager<SdBlockDevice, DummyTimeSource>;
+
+pub const ALLOWED_EXTENSIONS: [&str; 1] = ["WAV"];
 
 /// A trivial `TimeSource`; we do not set real file timestamps.
 #[derive(Clone, Copy, Default)]
@@ -160,9 +161,9 @@ impl SdStorage {
         true
     }
 
-    /// Populate `out` with the `.wav` files in the root directory. Mirrors
-    /// `list_wav_files` (FAT enumeration order; not lexically sorted).
-    pub fn list_wav_files(&self, out: &mut TrackList) {
+    /// Populate `out` with the allowed files in the root directory. Mirrors
+    /// `list_files` (FAT enumeration order; not lexically sorted).
+    pub fn list_files(&self, out: &mut TrackList) {
         out.count = 0;
         let Some(root) = self.root else {
             return;
@@ -175,18 +176,25 @@ impl SdStorage {
             if entry.name.base_name().starts_with(b"._") {
                 return;
             }
-            if entry.name.extension().eq_ignore_ascii_case(b"WAV") {
-                out.push(entry.name.clone());
+
+            // Check if the file extension is allowed.
+            match from_utf8(entry.name.extension()) {
+                Ok(ext) => {
+                    if ALLOWED_EXTENSIONS.contains(&ext) {
+                        out.push(entry.name.clone());
+                    }
+                }
+                Err(_) => {}
             }
         });
+        
         if let Err(e) = result {
             warn!("Failed to list directory: {:?}", e);
         }
     }
 
-    /// Open a track and seek past its WAV header to the first PCM sample.
-    /// Mirrors `open(path)` + `_skip_to_pcm`. Returns `None` on error.
-    pub fn open_wav(&self, name: &ShortFileName) -> Option<RawFile> {
+    /// Open a file in the root directory for reading. Returns `None` on error.
+    pub fn open_file(&self, name: &ShortFileName) -> Option<RawFile> {
         let root = self.root?;
         let file = match self.vm.open_file_in_dir(root, name, Mode::ReadOnly) {
             Ok(f) => f,
@@ -195,10 +203,7 @@ impl SdStorage {
                 return None;
             }
         };
-        if !self.skip_to_pcm(file) {
-            self.close(file);
-            return None;
-        }
+
         Some(file)
     }
 
@@ -207,72 +212,24 @@ impl SdStorage {
         let _ = self.vm.close_file(file);
     }
 
-    /// Fill `words` with packed stereo frames read from `file`, zero-padding any
-    /// remainder. Returns the count of real frames (0 at EOF). This is the
-    /// `_read_pcm_chunk` + byte->I2S-word packing rolled into one step.
-    pub fn fill_words(&self, file: RawFile, words: &mut [u32], staging: &mut [u8]) -> usize {
-        let frames_cap = words.len();
-        let need = frames_cap * FRAME_BYTES;
-        let buf = &mut staging[..need];
-
-        let mut got = 0;
-        while got < need {
-            match self.vm.read(file, &mut buf[got..]) {
-                Ok(0) => break,
-                Ok(n) => got += n,
-                Err(e) => {
-                    warn!("SD read error: {:?}", e);
-                    break;
-                }
+    /// Read up to `buf.len()` bytes. Returns bytes read (`0` at EOF or on error).
+    pub fn read(&self, file: RawFile, buf: &mut [u8]) -> usize {
+        match self.vm.read(file, buf) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("SD read error: {:?}", e);
+                0
             }
         }
-
-        // Drop any trailing partial frame, like `nbytes & ~(FRAME_BYTES - 1)`.
-        let frames = got / FRAME_BYTES;
-        for i in 0..frames {
-            let b = i * FRAME_BYTES;
-            let left = i16::from_le_bytes([buf[b], buf[b + 1]]);
-            let right = i16::from_le_bytes([buf[b + 2], buf[b + 3]]);
-            words[i] = pack_frame(left, right);
-        }
-        for w in words.iter_mut().skip(frames) {
-            *w = 0;
-        }
-        frames
     }
 
-    /// Validate the RIFF/WAVE header and seek to the `data` chunk payload.
-    fn skip_to_pcm(&self, file: RawFile) -> bool {
-        let mut header = [0u8; 12];
-        if !self.read_exact(file, &mut header) {
-            return false;
-        }
-        if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
-            warn!("Not a WAV file");
-            return false;
-        }
-
-        loop {
-            let mut chunk = [0u8; 8];
-            if !self.read_exact(file, &mut chunk) {
-                warn!("WAV data chunk not found");
-                return false;
-            }
-            let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-            if &chunk[0..4] == b"data" {
-                return true;
-            }
-            // RIFF chunks are padded to an even byte count.
-            let skip = size as i32 + (size & 1) as i32;
-            if self.vm.file_seek_from_current(file, skip).is_err() {
-                warn!("WAV seek failed");
-                return false;
-            }
-        }
+    /// Seek relative to the current file position.
+    pub fn seek_from_current(&self, file: RawFile, offset: i32) -> bool {
+        self.vm.file_seek_from_current(file, offset).is_ok()
     }
 
     /// Read exactly `buf.len()` bytes, returning `false` on short read/error.
-    fn read_exact(&self, file: RawFile, buf: &mut [u8]) -> bool {
+    pub fn read_exact(&self, file: RawFile, buf: &mut [u8]) -> bool {
         let mut off = 0;
         while off < buf.len() {
             match self.vm.read(file, &mut buf[off..]) {

@@ -20,6 +20,7 @@ use static_cell::StaticCell;
 
 use crate::dac::Dac;
 use crate::display::Display;
+use crate::format::AudioSource;
 use crate::sd::{FRAME_BYTES, SdStorage, TrackList};
 
 /// Stereo frames per buffer half. At 44.1 kHz this is ~46 ms of audio.
@@ -62,6 +63,8 @@ pub enum Command {
 /// Construct one as a `static` (e.g. `static CONTROL: PlayerControl = PlayerControl::new();`)
 /// so both the player task and a controller task can reach it.
 pub type PlayerControl = Signal<CriticalSectionRawMutex, Command>;
+
+// 
 
 /// Streams WAV files from the SD card to the DAC.
 pub struct PlaybackController {
@@ -114,7 +117,7 @@ impl PlaybackController {
 
     /// Enumerate `.wav` tracks on the card into `out`. Mirrors `list_tracks()`.
     pub fn list_tracks(&self, out: &mut TrackList) {
-        self.sd.list_wav_files(out);
+        self.sd.list_files(out);
     }
 
     /// Current transport state.
@@ -147,8 +150,8 @@ impl PlaybackController {
         let Self { dac, sd, state, buffers } = self;
         let mut display = display;
 
-        let file = match sd.open_wav(name) {
-            Some(f) => f,
+        let source = match AudioSource::open(sd, name) {
+            Some(s) => s,
             None => {
                 warn!("Failed to open track");
                 *state = State::Stopped;
@@ -174,10 +177,10 @@ impl PlaybackController {
         let mut unmuted = true;
 
         // Prime the first buffer; bail out if the file holds no audio.
-        let primed = sd.fill_words(file, front, staging);
+        let primed = source.fill_frames(sd, front, staging);
         if primed == 0 {
             warn!("Track contained no PCM samples");
-            sd.close(file);
+            source.close(sd);
             dac.mute();
             *state = State::Stopped;
             return false;
@@ -228,7 +231,7 @@ impl PlaybackController {
             // Start DMA on the full front buffer, refill back while it plays,
             // then wait for the transfer to finish and swap halves.
             let transfer = dac.write(front);
-            let next = sd.fill_words(file, back, staging);
+            let next = source.fill_frames(sd, back, staging);
             transfer.await;
 
             // Fade in after the first buffer has been delivered, like the
@@ -249,7 +252,7 @@ impl PlaybackController {
         }
 
         dac.mute();
-        sd.close(file);
+        source.close(sd);
         *state = State::Stopped;
         if let Some(d) = display.as_deref_mut() {
             d.now_playing(index, total, name, *state);

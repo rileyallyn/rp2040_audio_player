@@ -6,6 +6,7 @@ mod display;
 mod player;
 mod sd;
 mod tone;
+mod format;
 
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
