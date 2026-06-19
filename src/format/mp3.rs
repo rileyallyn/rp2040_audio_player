@@ -1,12 +1,12 @@
 use embedded_sdmmc::{RawFile, ShortFileName};
-use log::warn;
+use log::{info, warn};
 use nanomp3::{Channels, Decoder, FrameInfo, MAX_SAMPLES_PER_FRAME};
 
 use crate::dac::{pack_frame, SAMPLE_RATE};
 use crate::sd::SdStorage;
 
-/// Room for one max-sized MPEG frame plus a little slack.
-const MP3_CARRY_CAP: usize = 1536;
+/// minimp3 recommends ≥16 KiB of compressed data in the decode window.
+const COMPACT_THRESHOLD: usize = 4096;
 
 pub struct Mp3Decoder {
     file: RawFile,
@@ -17,8 +17,10 @@ pub struct Mp3Decoder {
     pending_len: usize,
     channels: Channels,
     sample_rate: u32,
-    mp3_carry: [u8; MP3_CARRY_CAP],
-    mp3_carry_len: usize,
+    /// Start of unconsumed compressed data in the shared staging buffer.
+    staging_off: usize,
+    /// Bytes of compressed audio from `staging_off`.
+    staging_len: usize,
     eof: bool,
 }
 
@@ -33,8 +35,8 @@ impl Mp3Decoder {
             pending_len: 0,
             channels: Channels::Stereo,
             sample_rate: 0,
-            mp3_carry: [0; MP3_CARRY_CAP],
-            mp3_carry_len: 0,
+            staging_off: 0,
+            staging_len: 0,
             eof: false,
         })
     }
@@ -62,13 +64,23 @@ impl Mp3Decoder {
                 break;
             }
 
-            if !self.decode_next_frame(sd, staging) {
+            if self.decode_next_frame(sd, staging) {
+                continue;
+            }
+            if self.eof {
+                break;
+            }
+            // Partial MPEG frame buffered in staging; retry without zero-padding.
+            if self.staging_len == 0 {
                 break;
             }
         }
 
         for w in words.iter_mut().skip(out) {
             *w = 0;
+        }
+        if out < target && !self.eof {
+            warn!("MP3 partial buffer: {} / {} frames", out, target);
         }
         out
     }
@@ -78,54 +90,77 @@ impl Mp3Decoder {
     }
 
     fn drain_pending(&mut self, words: &mut [u32], out: usize, target: usize) -> usize {
+        let mono = self.channels == Channels::Mono;
         let mut written = 0;
         while out + written < target && self.pending_off < self.pending_len {
             let left = f32_to_i16(self.pcm_buf[self.pending_off]);
-            let right = if self.channels == Channels::Mono {
+            let right = if mono {
                 left
             } else {
                 f32_to_i16(self.pcm_buf[self.pending_off + 1])
             };
-            self.pending_off += if self.channels == Channels::Mono { 1 } else { 2 };
+            self.pending_off += if mono { 1 } else { 2 };
             words[out + written] = pack_frame(left, right);
             written += 1;
         }
         written
     }
 
+    fn compact_if_needed(&mut self, staging: &mut [u8]) {
+        if self.staging_off == 0 {
+            return;
+        }
+        if self.staging_off >= COMPACT_THRESHOLD
+            || self.staging_off + self.staging_len >= staging.len()
+        {
+            staging.copy_within(self.staging_off..self.staging_off + self.staging_len, 0);
+            self.staging_off = 0;
+        }
+    }
+
+    fn read_into_staging(&mut self, sd: &SdStorage, staging: &mut [u8]) {
+        if self.eof {
+            return;
+        }
+        while self.staging_off + self.staging_len < staging.len() {
+            let write_at = self.staging_off + self.staging_len;
+            let n = sd.read(self.file, &mut staging[write_at..]);
+            if n == 0 {
+                self.eof = true;
+                break;
+            }
+            self.staging_len += n;
+        }
+    }
+
     /// Pull the next MPEG frame from SD. Returns `false` when no more audio is available.
     fn decode_next_frame(&mut self, sd: &SdStorage, staging: &mut [u8]) -> bool {
         loop {
-            let mut filled = self.mp3_carry_len;
-            if filled > 0 {
-                staging[..filled].copy_from_slice(&self.mp3_carry[..filled]);
-                self.mp3_carry_len = 0;
+            self.compact_if_needed(staging);
+            self.read_into_staging(sd, staging);
+
+            if self.staging_len == 0 {
+                return false;
             }
 
-            if filled < staging.len() {
-                let n = sd.read(self.file, &mut staging[filled..]);
-                if n == 0 && filled == 0 {
-                    self.eof = true;
-                    return false;
-                }
-                filled += n;
-            }
-
-            let src = &staging[..filled];
+            let end = self.staging_off + self.staging_len;
+            let src = &staging[self.staging_off..end];
             let (consumed, info) = self.decoder.decode(src, &mut self.pcm_buf);
 
             if consumed == 0 {
-                if filled > MP3_CARRY_CAP {
+                if self.staging_len >= staging.len() {
                     warn!("MP3 sync lost");
                     self.eof = true;
                     return false;
                 }
-                self.mp3_carry[..filled].copy_from_slice(src);
-                self.mp3_carry_len = filled;
-                return false;
+                if self.eof {
+                    return false;
+                }
+                continue;
             }
 
-            self.save_mp3_tail(staging, filled, consumed);
+            self.staging_off += consumed;
+            self.staging_len -= consumed;
 
             let Some(info) = info else {
                 // ID3 or other non-audio frame; keep decoding from the refreshed buffer.
@@ -144,24 +179,14 @@ impl Mp3Decoder {
         }
     }
 
-    fn save_mp3_tail(&mut self, staging: &[u8], filled: usize, consumed: usize) {
-        if consumed >= filled {
-            return;
-        }
-        let tail = filled - consumed;
-        if tail > MP3_CARRY_CAP {
-            warn!("MP3 carry overflow");
-            self.eof = true;
-            return;
-        }
-        self.mp3_carry[..tail].copy_from_slice(&staging[consumed..filled]);
-        self.mp3_carry_len = tail;
-    }
-
     fn note_format(&mut self, info: &FrameInfo) -> bool {
         if self.sample_rate == 0 {
             self.sample_rate = info.sample_rate;
             self.channels = info.channels;
+            info!(
+                "MP3 stream: {} Hz, {} kb/s",
+                self.sample_rate, info.bitrate
+            );
             if self.sample_rate != SAMPLE_RATE {
                 warn!(
                     "Unsupported MP3 sample rate {} Hz (need {})",

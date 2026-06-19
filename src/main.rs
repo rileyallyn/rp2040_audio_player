@@ -45,7 +45,7 @@ static PLAYBACK_DONE: PlaybackDoneSignal = PlaybackDoneSignal::new();
 static PLAYER: StaticCell<PlayerMutex> = StaticCell::new();
 
 /// 440 Hz sine at boot for DAC bring-up (`test_playback.py`). Set to 0 to skip.
-const BOOT_TONE_SECS: u32 = 3;
+const BOOT_TONE_SECS: u32 = 0;
 
 #[embassy_executor::task]
 async fn logger_task(usb: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>) {

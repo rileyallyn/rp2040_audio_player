@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use log::{info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::Instant;
 use embedded_sdmmc::ShortFileName;
 use static_cell::StaticCell;
 
@@ -25,8 +26,10 @@ use crate::display::Display;
 use crate::format::AudioSource;
 use crate::sd::{FRAME_BYTES, SdStorage, TrackList};
 
-/// Stereo frames per buffer half. At 44.1 kHz this is ~46 ms of audio.
-pub const BUFFER_FRAMES: usize = 2048;
+/// Stereo frames per buffer half. At 44.1 kHz this is ~93 ms of audio.
+/// MP3 decode is CPU-heavy; WAV only needs SD reads and can tolerate smaller
+/// buffers, but the shared size gives the decoder more time while DMA plays.
+pub const BUFFER_FRAMES: usize = 4096;
 
 const BUFFER_WORDS: usize = BUFFER_FRAMES;
 
@@ -36,6 +39,7 @@ const WARMUP_WORDS: usize = 512;
 struct PlayBuffers {
     a: [u32; BUFFER_WORDS],
     b: [u32; BUFFER_WORDS],
+    c: [u32; BUFFER_WORDS],
     staging: [u8; BUFFER_FRAMES * FRAME_BYTES],
 }
 
@@ -117,6 +121,7 @@ impl PlaybackController {
         let buffers = PLAY_BUFFERS.init_with(|| PlayBuffers {
             a: [0; BUFFER_WORDS],
             b: [0; BUFFER_WORDS],
+            c: [0; BUFFER_WORDS],
             staging: [0; BUFFER_FRAMES * FRAME_BYTES],
         });
         set_playback_state(State::Stopped);
@@ -201,8 +206,9 @@ impl PlaybackController {
             }
         };
 
-        let mut front: &mut [u32] = &mut buffers.a;
-        let mut back: &mut [u32] = &mut buffers.b;
+        let mut playing: &mut [u32] = &mut buffers.a;
+        let mut ready: &mut [u32] = &mut buffers.b;
+        let mut spare: &mut [u32] = &mut buffers.c;
         let staging = &mut buffers.staging;
 
         dac.mute();
@@ -216,9 +222,9 @@ impl PlaybackController {
         dac.start_output().await;
         let mut unmuted = true;
 
-        // Prime the first buffer; bail out if the file holds no audio.
-        let primed = source.fill_frames(sd, front, staging);
-        if primed == 0 {
+        // Prime two buffers so decode always runs one buffer ahead of playback.
+        let mut playing_len = source.fill_frames(sd, playing, staging);
+        if playing_len == 0 {
             warn!("Track contained no PCM samples");
             source.close(sd);
             dac.mute();
@@ -226,7 +232,14 @@ impl PlaybackController {
             set_playback_state(State::Stopped);
             return false;
         }
-        info!("Streaming {} frame(s) from track", primed);
+        let mut ready_len = source.fill_frames(sd, ready, staging);
+        info!(
+            "Streaming {} + {} frame(s) primed",
+            playing_len, ready_len
+        );
+
+        let mut max_fill_ms = 0u64;
+        let mut buffer_count = 0u32;
 
         let finished;
         'outer: loop {
@@ -271,24 +284,33 @@ impl PlaybackController {
                 }
             }
 
-            // Start DMA on the full front buffer, refill back while it plays,
-            // then wait for the transfer to finish and swap halves.
-            let transfer = dac.write(front);
-            let next = source.fill_frames(sd, back, staging);
+            // Triple-buffer: play `playing` while refilling `spare`. `ready` is
+            // already decoded, so the next DMA can start immediately after this
+            // transfer finishes even when refill overruns one buffer period.
+            let transfer = dac.write(&playing[..playing_len]);
+            let fill_start = Instant::now();
+            let spare_len = source.fill_frames(sd, spare, staging);
+            let fill_ms = fill_start.elapsed().as_millis();
+            max_fill_ms = max_fill_ms.max(fill_ms);
+            buffer_count += 1;
+            // Triple-buffering gives ~186 ms of decode budget per refill.
+            if fill_ms > 170 {
+                warn!("slow fill: {} ms (budget ~186 ms)", fill_ms);
+            }
             transfer.await;
 
-            // Fade in after the first buffer has been delivered, like the
-            // `_i2s_bytes_out >= buffer_size` unmute in the Python drain loop.
             if !unmuted {
                 dac.unmute();
                 unmuted = true;
                 info!("DAC unmuted");
             }
 
-            core::mem::swap(&mut front, &mut back);
+            core::mem::swap(&mut playing, &mut ready);
+            playing_len = ready_len;
+            core::mem::swap(&mut ready, &mut spare);
+            ready_len = spare_len;
 
-            // `back` carried no fresh audio: end of file, nothing left to play.
-            if next == 0 {
+            if playing_len == 0 {
                 finished = true;
                 break 'outer;
             }
@@ -302,7 +324,10 @@ impl PlaybackController {
             d.now_playing(index, total, name, *state);
         }
         if finished {
-            info!("Track finished");
+            info!(
+                "Track finished ({} buffers, max fill {} ms)",
+                buffer_count, max_fill_ms
+            );
         }
         finished
     }

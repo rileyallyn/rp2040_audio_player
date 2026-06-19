@@ -23,11 +23,8 @@ use core::str::from_utf8;
 /// Bytes per stereo frame (16-bit L + 16-bit R), matching `FRAME_BYTES`.
 pub const FRAME_BYTES: usize = 4;
 
-/// SPI clock for the card. The Python driver streamed at 15 MHz; we use a
-/// slightly more conservative 12 MHz. (Per spec, card *init* should happen at
-/// <=400 kHz; most modern microSD cards tolerate a fast fixed clock, but if a
-/// particular card refuses to mount, lower this value.)
-const SD_BAUD: u32 = 12_000_000;
+/// SPI clock for the card. The Python driver streamed at 15 MHz.
+const SD_BAUD: u32 = 15_000_000;
 
 /// Largest number of tracks we will enumerate.
 pub const MAX_TRACKS: usize = 64;
